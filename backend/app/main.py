@@ -1,509 +1,307 @@
 import asyncio
+from contextlib import asynccontextmanager
 import json
 import logging
-import math
+import os
 import time
-from typing import Dict, List, Set, Tuple, Union
+from typing import Dict, List, Optional, Set
 
-import cv2
-import numpy as np
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
-from ultralytics import YOLO
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from pydantic import BaseModel
+
+from app.core.config import settings
+from app.core.pipeline import camera_manager, VisionEnhancer
+from app.routes import alerts as legacy_alerts
+from app.routes import auth as legacy_auth
+from app.routes import cameras as legacy_cameras
+from app.routes import detection as legacy_detection
+from app.routes import face_detection as legacy_face_detection
+from app.routes import heatmap as legacy_heatmap
 
 # ==============================================================================
 # SENTRY-AI: Tactical Border Surveillance Perimeter Engine (PS ID: SIH26187)
-# Multi-Camera CCTV Switching & Real-Time Tactical AI Geofencing Engine
+# Production-Hardened Real-Time Multi-Camera AI Defense Platform
 # ==============================================================================
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - [%(levelname)s] - %(message)s")
-logger = logging.getLogger("SentryAI")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - [%(levelname)s] - [%(name)s] - %(message)s",
+)
+logger = logging.getLogger("SentryAI.Server")
+
+# Active WebSocket Connections Set & Event Loop Reference
+active_connections: Set[WebSocket] = set()
+connections_lock = asyncio.Lock()
+server_loop: Optional[asyncio.AbstractEventLoop] = None
+
+
+async def broadcast_alert(payload: dict):
+    """Safely broadcasts tactical alert or telemetry packet to all connected WebSocket clients."""
+    if not active_connections:
+        return
+    message = json.dumps(payload)
+    disconnected = set()
+    
+    async with connections_lock:
+        for ws in list(active_connections):
+            try:
+                await ws.send_text(message)
+            except Exception:
+                disconnected.add(ws)
+        for dead in disconnected:
+            active_connections.discard(dead)
+
+
+def broadcast_alert_sync(payload: dict):
+    """Thread-safe synchronous bridge for background worker threads to broadcast via event loop."""
+    global server_loop
+    if server_loop and server_loop.is_running():
+        asyncio.run_coroutine_threadsafe(broadcast_alert(payload), server_loop)
+
+
+async def heartbeat_broadcast_loop():
+    """Periodically broadcasts live system telemetry heartbeats to all connected UI clients."""
+    while True:
+        try:
+            await asyncio.sleep(1.5)
+            if active_connections:
+                status = camera_manager.get_system_status()
+                cams = camera_manager.get_all_cameras_telemetry()
+                packet = {
+                    "event": "SYSTEM_HEARTBEAT",
+                    "telemetry": status,
+                    "cameras": cams,
+                    "timestamp": time.strftime("%H:%M:%S"),
+                }
+                await broadcast_alert(packet)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.debug(f"Heartbeat loop exception: {e}")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global server_loop
+    server_loop = asyncio.get_running_loop()
+    logger.info("Initializing SENTRY-AI Multi-Camera Pipeline...")
+    camera_manager.initialize(alert_broadcaster=broadcast_alert_sync)
+    heartbeat_task = asyncio.create_task(heartbeat_broadcast_loop())
+    logger.info("SENTRY-AI Tactical Pipeline fully operational.")
+    try:
+        yield
+    finally:
+        logger.info("Shutting down SENTRY-AI Pipeline...")
+        heartbeat_task.cancel()
+        camera_manager.shutdown()
+
 
 app = FastAPI(
-    title="SentryAI Tactical Border Surveillance",
-    description="Multi-Camera Tactical AI Perimeter Defense & Zero-Line Geofencing Engine",
-    version="2.1.0",
+    title=settings.PROJECT_NAME,
+    description="Autonomous Multi-Camera Edge AI Perimeter Defense & Zero-Line Geofencing Engine",
+    version=settings.VERSION,
+    lifespan=lifespan,
 )
 
 # Enable CORS for all origins
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=settings.CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Load YOLOv8 model
-try:
-    model = YOLO("yolov8n.pt")
-    logger.info("YOLOv8 model initialized.")
-except Exception as e:
-    logger.warning(f"Error loading YOLOv8 model locally: {e}. Model will auto-download.")
-    model = YOLO("yolov8n.pt")
-
-# ==============================================================================
-# MULTI-CAMERA REGISTRY
-# ==============================================================================
-
-CAMERA_FEEDS: Dict[str, Dict[str, Union[int, str]]] = {
-    "0": {
-        "id": "0",
-        "source": 0,
-        "name": "Sector A (Command Post Webcam)",
-        "coordinates": "LAT 34.0836° N / LON 74.7973° E",
-        "type": "OPTICAL_SURVEILLANCE",
-    },
-    "1": {
-        "id": "1",
-        "source": "http://192.168.1.50:8080/video",
-        "name": "Sector B (Perimeter Buffer Node / Phone IP)",
-        "coordinates": "LAT 34.0912° N / LON 74.8021° E",
-        "type": "BUFFER_ZONE_IR",
-    },
-}
-
-# ==============================================================================
-# WEBSOCKET CONNECTION MANAGER & ALERT STATE
-# ==============================================================================
-
-active_connections: Set[WebSocket] = set()
-tracked_targets: Dict[str, Dict] = {}
-
-TARGET_CLASSES = {
-    0: "person",
-    1: "bicycle",
-    2: "car",
-    3: "motorcycle",
-    5: "bus",
-    7: "truck",
-    24: "backpack",
-    26: "handbag",
-    28: "suitcase",
-    43: "knife",
-    76: "scissors",
-}
-
-WEAPON_CLASSES = {"knife", "scissors"}
-VEHICLE_CLASSES = {"car", "truck", "bus", "motorcycle"}
-
-
-async def broadcast_alert(alert_payload: dict):
-    """Broadcasts tactical threat telemetry to all active WebSocket clients."""
-    if not active_connections:
-        return
-    message = json.dumps(alert_payload)
-    disconnected = set()
-    for connection in active_connections:
-        try:
-            await connection.send_text(message)
-        except Exception:
-            disconnected.add(connection)
-    for dead in disconnected:
-        active_connections.discard(dead)
+# Mount legacy routes for full backward compatibility
+app.include_router(legacy_detection.router)
+app.include_router(legacy_cameras.router)
+app.include_router(legacy_alerts.router)
+app.include_router(legacy_heatmap.router)
+app.include_router(legacy_auth.router)
+app.include_router(legacy_face_detection.router)
 
 
 # ==============================================================================
-# VISION PROCESSING & NIGHT-VISION CLAHE FILTER
-# ==============================================================================
-
-def apply_clahe(frame: np.ndarray) -> np.ndarray:
-    """Applies Contrast Limited Adaptive Histogram Equalization (CLAHE) for low-light/fog penetration."""
-    try:
-        lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
-        l_channel, a_channel, b_channel = cv2.split(lab)
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-        cl = clahe.apply(l_channel)
-        merged = cv2.merge((cl, a_channel, b_channel))
-        return cv2.cvtColor(merged, cv2.COLOR_LAB2BGR)
-    except Exception:
-        return frame
-
-
-def draw_tactical_hud(
-    frame: np.ndarray,
-    zero_line_y: int,
-    breach_active: bool,
-    cam_id: str,
-    sector_name: str,
-    coords: str,
-) -> np.ndarray:
-    """Draws tactical border military HUD, Zero-Line boundary, and status telemetry."""
-    h, w = frame.shape[:2]
-
-    # Draw Zero Line (Virtual Polygon Geofence)
-    line_color = (0, 0, 255) if breach_active else (0, 140, 255)
-    cv2.line(frame, (0, zero_line_y), (w, zero_line_y), line_color, 2)
-
-    # Boundary warning markers
-    for x in range(0, w, 32):
-        cv2.circle(frame, (x, zero_line_y), 3, (0, 0, 255) if breach_active else (0, 220, 255), -1)
-
-    # Zero Line Tag Badge
-    tag_text = "ZERO LINE // RESTRICTED ZONE" if not breach_active else "!!! ZERO LINE BREACH ACTIVE !!!"
-    cv2.rectangle(frame, (10, zero_line_y - 25), (330, zero_line_y - 5), (10, 15, 30), -1)
-    cv2.putText(
-        frame,
-        tag_text,
-        (15, zero_line_y - 10),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.5,
-        (0, 0, 255) if breach_active else (0, 220, 255),
-        1,
-        cv2.LINE_AA,
-    )
-
-    # Top Tactical Header Banner
-    cv2.rectangle(frame, (0, 0), (w, 36), (10, 15, 29), -1)
-    cv2.line(frame, (0, 36), (w, 36), (0, 255, 180), 1)
-
-    hud_title = f"CAM-{cam_id} // {sector_name.upper()} [CLAHE NIGHT-VISION]"
-    cv2.putText(
-        frame,
-        hud_title,
-        (15, 23),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.5,
-        (0, 255, 180),
-        1,
-        cv2.LINE_AA,
-    )
-
-    timestamp = time.strftime("%Y-%m-%d %H:%M:%S UTC")
-    cv2.putText(
-        frame,
-        f"{coords} | {timestamp}",
-        (max(15, w - 460), 23),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.4,
-        (180, 200, 220),
-        1,
-        cv2.LINE_AA,
-    )
-
-    # Corner brackets (Tactical reticle)
-    reticle_len = 20
-    for corner in [(12, 46), (w - 12, 46), (12, h - 12), (w - 12, h - 12)]:
-        cx, cy = corner
-        dx = 1 if cx == 12 else -1
-        dy = 1 if cy == 46 else -1
-        cv2.line(frame, (cx, cy), (cx + dx * reticle_len, cy), (0, 255, 180), 1)
-        cv2.line(frame, (cx, cy), (cx, cy + dy * reticle_len), (0, 255, 180), 1)
-
-    return frame
-
-
-def process_detections(
-    frame: np.ndarray,
-    clahe_frame: np.ndarray,
-    zero_line_y: int,
-    cam_id: str,
-    sector_name: str,
-    loop: asyncio.AbstractEventLoop,
-) -> Tuple[np.ndarray, bool]:
-    """Runs YOLOv8 perimeter inference, optical expansion check, and geofence tracking for specific cam."""
-    global tracked_targets
-
-    results = model(clahe_frame, verbose=False, conf=0.30)
-    current_time = time.time()
-    breach_in_frame = False
-
-    for r in results:
-        boxes = r.boxes
-        if boxes is None:
-            continue
-
-        for box in boxes:
-            cls_id = int(box.cls[0].item())
-            conf = float(box.conf[0].item())
-            xyxy = box.xyxy[0].cpu().numpy()
-            x1, y1, x2, y2 = map(int, xyxy)
-            w = max(1, x2 - x1)
-            h = max(1, y2 - y1)
-            area = float(w * h)
-            center_x = (x1 + x2) // 2
-            center_y = (y1 + y2) // 2
-
-            class_name = TARGET_CLASSES.get(cls_id, model.names.get(cls_id, "unknown"))
-
-            is_weapon = class_name in WEAPON_CLASSES
-            is_person = class_name == "person"
-            is_vehicle = class_name in VEHICLE_CLASSES
-            is_luggage = class_name in {"backpack", "handbag", "suitcase"}
-
-            if not (is_weapon or is_person or is_vehicle or is_luggage):
-                continue
-
-            # Geofence breach check (Zero-Line Boundary Crossing)
-            geofence_breach = y2 >= zero_line_y or center_y >= zero_line_y
-            if geofence_breach:
-                breach_in_frame = True
-
-            # Unique spatial key per cam
-            grid_x = center_x // 60
-            grid_y = center_y // 60
-            target_key = f"cam{cam_id}_{class_name}_{grid_x}_{grid_y}"
-
-            if target_key not in tracked_targets:
-                tracked_targets[target_key] = {
-                    "count": 1,
-                    "last_area": area,
-                    "last_seen": current_time,
-                    "alerted": False,
-                    "rapid_expansion": False,
-                }
-            else:
-                target_data = tracked_targets[target_key]
-                target_data["count"] += 1
-                target_data["last_seen"] = current_time
-
-                # Optical Expansion Check
-                prev_area = target_data.get("last_area", area)
-                if prev_area > 0:
-                    area_growth = (area - prev_area) / prev_area
-                    if area_growth > 0.18 and target_data["count"] >= 2:
-                        target_data["rapid_expansion"] = True
-                target_data["last_area"] = area
-
-            target_state = tracked_targets[target_key]
-            persistence_count = target_state["count"]
-            rapid_expansion = target_state.get("rapid_expansion", False)
-
-            # Determine Threat Level
-            if is_weapon or geofence_breach or (rapid_expansion and (is_person or is_vehicle)):
-                threat_level = "CRITICAL"
-            else:
-                threat_level = "WARNING"
-
-            # Draw Tactical Bounding Box
-            color = (0, 0, 255) if threat_level == "CRITICAL" else (0, 220, 255)
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-
-            corner_len = min(15, w // 4, h // 4)
-            cv2.line(frame, (x1, y1), (x1 + corner_len, y1), (255, 255, 255), 2)
-            cv2.line(frame, (x1, y1), (x1, y1 + corner_len), (255, 255, 255), 2)
-            cv2.line(frame, (x2, y2), (x2 - corner_len, y2), (255, 255, 255), 2)
-            cv2.line(frame, (x2, y2), (x2, y2 - corner_len), (255, 255, 255), 2)
-
-            # Telemetry label
-            label = f"{class_name.upper()} {int(conf * 100)}% [{threat_level}]"
-            if rapid_expansion:
-                label += " [APPROACHING]"
-            if geofence_breach:
-                label += " [ZERO-LINE BREACH]"
-
-            (lw, lh), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.44, 1)
-            cv2.rectangle(frame, (x1, max(36, y1 - 20)), (x1 + lw + 8, max(36, y1)), (15, 20, 35), -1)
-            cv2.putText(
-                frame,
-                label,
-                (x1 + 4, max(36, y1 - 6)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.42,
-                color,
-                1,
-                cv2.LINE_AA,
-            )
-
-            # Broadcast verified threat telemetry tagged with active cam_id & sector
-            if persistence_count >= 3 and not target_state["alerted"]:
-                target_state["alerted"] = True
-                alert_payload = {
-                    "cam_id": str(cam_id),
-                    "sector": sector_name,
-                    "threat": class_name.upper(),
-                    "confidence": round(conf * 100, 1),
-                    "threat_level": threat_level,
-                    "geofence_breach": bool(geofence_breach),
-                    "optical_expansion": bool(rapid_expansion),
-                    "timestamp": time.strftime("%H:%M:%S"),
-                }
-                asyncio.run_coroutine_threadsafe(broadcast_alert(alert_payload), loop)
-
-    # Prune stale tracks
-    stale_keys = [k for k, v in tracked_targets.items() if current_time - v["last_seen"] > 2.5]
-    for k in stale_keys:
-        del tracked_targets[k]
-
-    return frame, breach_in_frame
-
-
-def generate_synthetic_border_frame(sim_step: int, cam_id: str, width: int = 640, height: int = 480) -> np.ndarray:
-    """Generates synthetic tactical night-vision border feed when physical/IP camera is unavailable."""
-    frame = np.zeros((height, width, 3), dtype=np.uint8)
-    cam_offset = int(cam_id) if cam_id.isdigit() else 0
-
-    # Synthetic terrain background
-    for y in range(height):
-        intensity = int(16 + 26 * (y / height))
-        tint = (intensity // 2, intensity + (cam_offset * 10), intensity // 3)
-        frame[y, :] = tint
-
-    # Border wire simulation
-    zero_line_y = int(height * 0.6)
-    cv2.line(frame, (0, zero_line_y + 10), (width, zero_line_y + 10), (35, 45, 55), 1)
-
-    # Target entity simulation
-    cycle = ((sim_step + cam_offset * 60) % 240) / 240.0
-    person_x = int(120 + 380 * math.sin(cycle * math.pi + cam_offset))
-    person_y = int(zero_line_y - 75 + 120 * cycle)
-    scale = 0.5 + 0.8 * cycle
-
-    pw, ph = int(30 * scale), int(70 * scale)
-    px1, py1 = max(0, person_x - pw // 2), max(0, person_y - ph)
-    px2, py2 = min(width - 1, px1 + pw), min(height - 1, py1 + ph)
-
-    cv2.ellipse(frame, (person_x, py1 + int(ph * 0.2)), (int(pw * 0.3), int(ph * 0.15)), 0, 0, 360, (60, 180, 70), -1)
-    cv2.rectangle(frame, (px1 + 4, py1 + int(ph * 0.35)), (px2 - 4, py2), (50, 160, 60), -1)
-
-    # Realistic sensor noise
-    noise = np.random.normal(0, 6, frame.shape).astype(np.int16)
-    frame = np.clip(frame.astype(np.int16) + noise, 0, 255).astype(np.uint8)
-
-    return frame
-
-
-def video_stream_generator(cam_id: str):
-    """Streams MJPEG video feed for requested cam_id with CLAHE enhancement & YOLOv8 detections."""
-    loop = asyncio.get_event_loop()
-    cam_info = CAMERA_FEEDS.get(
-        str(cam_id),
-        {
-            "id": str(cam_id),
-            "source": int(cam_id) if cam_id.isdigit() else str(cam_id),
-            "name": f"Sector {cam_id} (Perimeter Stream)",
-            "coordinates": "LAT 34.0836° N / LON 74.7973° E",
-        },
-    )
-
-    cam_source = cam_info.get("source", 0)
-    sector_name = cam_info.get("name", f"Sector {cam_id}")
-    coords = cam_info.get("coordinates", "LAT 34.0836° N / LON 74.7973° E")
-
-    cap = None
-    use_synthetic = False
-
-    try:
-        if isinstance(cam_source, int) or (isinstance(cam_source, str) and cam_source.isdigit()):
-            cap = cv2.VideoCapture(int(cam_source))
-        else:
-            cap = cv2.VideoCapture(str(cam_source))
-
-        if not cap or not cap.isOpened():
-            logger.warning(f"Camera {cam_id} source '{cam_source}' unavailable. Using Synthetic Simulator.")
-            use_synthetic = True
-    except Exception as e:
-        logger.warning(f"Failed to open camera {cam_id}: {e}. Using Synthetic Simulator.")
-        use_synthetic = True
-
-    sim_step = 0
-
-    try:
-        while True:
-            sim_step += 1
-            if not use_synthetic and cap is not None and cap.isOpened():
-                success, frame = cap.read()
-                if not success:
-                    frame = generate_synthetic_border_frame(sim_step, cam_id)
-            else:
-                frame = generate_synthetic_border_frame(sim_step, cam_id)
-                time.sleep(0.04)
-
-            h, w = frame.shape[:2]
-            zero_line_y = int(h * 0.6)
-
-            # 1. CLAHE Contrast & Low-Light Enhancement
-            clahe_enhanced = apply_clahe(frame)
-
-            # 2. YOLOv8 Detections & Zero-Line Geofence Tracking
-            annotated_frame, breach_active = process_detections(
-                frame, clahe_enhanced, zero_line_y, cam_id, sector_name, loop
-            )
-
-            # 3. Tactical Military HUD Overlay
-            tactical_frame = draw_tactical_hud(
-                annotated_frame, zero_line_y, breach_active, cam_id, sector_name, coords
-            )
-
-            # 4. MJPEG Encoding
-            ret, buffer = cv2.imencode(".jpg", tactical_frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
-            if not ret:
-                continue
-
-            frame_bytes = buffer.tobytes()
-            yield (
-                b"--frame\r\n"
-                b"Content-Type: image/jpeg\r\n\r\n" + frame_bytes + b"\r\n"
-            )
-    finally:
-        if cap is not None:
-            cap.release()
-
-
-# ==============================================================================
-# REST & WEBSOCKET ENDPOINTS
+# REST ENDPOINTS
 # ==============================================================================
 
 @app.get("/")
 def root():
     return {
-        "system": "SENTRY-AI Tactical Border Surveillance Perimeter Engine",
-        "ps_id": "SIH26187",
+        "system": settings.PROJECT_NAME,
+        "ps_id": settings.PS_ID,
+        "version": settings.VERSION,
         "status": "OPERATIONAL",
         "features": [
-            "Multi-Camera Dynamic Switching",
-            "CLAHE Night/Fog Vision Enhancement",
-            "Zero-Line Virtual Geofencing",
-            "Optical Expansion Trajectory Check",
-            "Real-time WebSocket Threat Telemetry",
+            "Bounded Low-Latency Frame Pipeline",
+            "Multi-Camera Dynamic Switching & Fault Isolation",
+            "CLAHE Night/Fog Vision Enhancement (Normal/Night/Auto)",
+            "Persistent Multi-Target Tracking & Direction Vectors",
+            "Zero-Line Boundary Crossing Geofencing",
+            "Alert Deduplication & Evidence Snapshot Recorder",
+            "Real-Time Telemetry & WebSocket Heartbeats",
         ],
+    }
+
+
+@app.get("/health")
+def get_health():
+    """Lightweight health check endpoint providing live uptime, cameras, and system load."""
+    status = camera_manager.get_system_status()
+    return {
+        "status": status["status"],
+        "service": "SENTRY-AI",
+        "uptime": status["uptime_seconds"],
+        "cameras_online": status["cameras_online"],
+        "active_tracks": status["active_tracks"],
+        "total_breaches": status["total_breaches"],
+        "inference_fps": status["avg_inference_fps"],
+        "cpu_usage": status["cpu_usage_pct"],
+        "memory_usage": status["memory_usage_pct"],
+        "timestamp": status["timestamp"],
+    }
+
+
+@app.get("/api/system/status")
+def get_system_telemetry():
+    """Returns detailed real-time telemetry for all cameras and system metrics."""
+    return {
+        "system": camera_manager.get_system_status(),
+        "cameras": camera_manager.get_all_cameras_telemetry(),
+        "recent_alerts": camera_manager.get_alerts_history(limit=10),
+    }
+
+
+@app.get("/api/cameras")
+def get_cameras_telemetry():
+    """Returns real-time telemetry for all configured surveillance cameras."""
+    return camera_manager.get_all_cameras_telemetry()
+
+
+@app.get("/api/cameras/{cam_id}")
+def get_single_camera_telemetry(cam_id: str):
+    """Returns telemetry for a specific camera channel."""
+    worker = camera_manager.get_worker(cam_id)
+    if not worker:
+        raise HTTPException(status_code=404, detail=f"Camera '{cam_id}' not found")
+    return worker.get_telemetry()
+
+
+class CameraConfigUpdate(BaseModel):
+    night_vision_mode: Optional[str] = None  # NORMAL, NIGHT_VISION, AUTO
+    zero_line_ratio: Optional[float] = None
+    confidence_threshold: Optional[float] = None
+
+
+@app.post("/api/cameras/{cam_id}/config")
+def update_camera_config(cam_id: str, cfg: CameraConfigUpdate):
+    """Dynamically updates runtime parameters for a specific camera feed."""
+    worker = camera_manager.get_worker(cam_id)
+    if not worker:
+        raise HTTPException(status_code=404, detail=f"Camera '{cam_id}' not found")
+    
+    if cfg.night_vision_mode is not None:
+        worker.night_vision_mode = cfg.night_vision_mode.upper()
+    if cfg.zero_line_ratio is not None:
+        worker.zero_line_ratio = max(0.2, min(0.9, float(cfg.zero_line_ratio)))
+        worker.tracker.zero_line_ratio = worker.zero_line_ratio
+    if cfg.confidence_threshold is not None:
+        worker.confidence_threshold = max(0.1, min(0.95, float(cfg.confidence_threshold)))
+
+    return {
+        "message": f"Camera {cam_id} configuration updated",
+        "telemetry": worker.get_telemetry(),
     }
 
 
 @app.get("/cameras/list")
 def get_cameras_list():
-    """Returns the list of configured surveillance cameras and sectors."""
+    """Backward-compatible camera listing endpoint."""
     return [
         {
-            "id": k,
-            "name": v.get("name", f"Camera {k}"),
-            "coordinates": v.get("coordinates", "LAT 34.0836° N / LON 74.7973° E"),
-            "type": v.get("type", "SURVEILLANCE"),
+            "id": cam["id"],
+            "name": cam["name"],
+            "coordinates": cam["coordinates"],
+            "type": cam["type"],
+            "status": cam["status"],
+            "capture_fps": cam["capture_fps"],
+            "inference_fps": cam["inference_fps"],
         }
-        for k, v in CAMERA_FEEDS.items()
+        for cam in camera_manager.get_all_cameras_telemetry()
     ]
+
+
+@app.get("/api/alerts")
+def get_alerts_history(limit: int = 50):
+    """Retrieves recent deduplicated incident alerts and breach records."""
+    return camera_manager.get_alerts_history(limit=limit)
+
+
+@app.get("/api/evidence/{filename}")
+def get_evidence_snapshot(filename: str):
+    """Streams captured breach evidence snapshot image."""
+    filepath = os.path.join(settings.EVIDENCE_DIR, filename)
+    if not os.path.exists(filepath):
+        raise HTTPException(status_code=404, detail="Evidence snapshot not found")
+    return FileResponse(filepath, media_type="image/jpeg")
+
+
+# ==============================================================================
+# VIDEO STREAM GENERATOR & MJPEG ENDPOINT
+# ==============================================================================
+
+async def mjpeg_stream_generator(cam_id: str):
+    """Streams MJPEG frames with zero-lag bounded buffer and connection isolation."""
+    worker = camera_manager.get_worker(cam_id)
+    boundary = b"--frame\r\nContent-Type: image/jpeg\r\n\r\n"
+
+    try:
+        while True:
+            if worker:
+                jpeg_bytes = worker.get_latest_jpeg()
+                if jpeg_bytes is not None:
+                    yield boundary + jpeg_bytes + b"\r\n"
+            await asyncio.sleep(0.035)  # ~28-30 FPS stream rate
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        logger.debug(f"Stream consumer disconnected for cam {cam_id}: {e}")
 
 
 @app.get("/video_feed/{cam_id}")
 async def video_feed(cam_id: str = "0"):
-    """Streams annotated MJPEG video feed for the specified camera ID."""
+    """Streams low-latency annotated MJPEG video feed for specified camera ID."""
     return StreamingResponse(
-        video_stream_generator(str(cam_id)),
+        mjpeg_stream_generator(str(cam_id)),
         media_type="multipart/x-mixed-replace; boundary=frame",
     )
 
 
+# ==============================================================================
+# WEBSOCKET & SOS DEMO DISPATCH
+# ==============================================================================
+
 @app.websocket("/ws/alerts")
 async def websocket_alerts(websocket: WebSocket):
-    """WebSocket endpoint broadcasting real-time threat telemetry tagged with active cam_id."""
+    """Resilient WebSocket endpoint broadcasting real-time threat telemetry and heartbeats."""
     await websocket.accept()
-    active_connections.add(websocket)
+    async with connections_lock:
+        active_connections.add(websocket)
     logger.info(f"Tactical Command Client connected. Total active clients: {len(active_connections)}")
 
-    # Initial handshake telemetry
+    # Send initial handshake packet
     try:
-        await websocket.send_text(
-            json.dumps({
-                "cam_id": "0",
-                "sector": "Sector A (Command Post Webcam)",
-                "threat": "PERIMETER_MONITOR_ONLINE",
-                "confidence": 100.0,
-                "threat_level": "WARNING",
-                "geofence_breach": False,
-                "timestamp": time.strftime("%H:%M:%S"),
-            })
-        )
+        handshake = {
+            "event": "HANDSHAKE_ESTABLISHED",
+            "system": settings.PROJECT_NAME,
+            "status": "ONLINE",
+            "telemetry": camera_manager.get_system_status(),
+            "cameras": camera_manager.get_all_cameras_telemetry(),
+            "timestamp": time.strftime("%H:%M:%S"),
+        }
+        await websocket.send_text(json.dumps(handshake))
     except Exception:
         pass
 
@@ -512,48 +310,68 @@ async def websocket_alerts(websocket: WebSocket):
             data = await websocket.receive_text()
             try:
                 msg = json.loads(data)
-                if msg.get("action") == "MOCK_SOS":
+                action = msg.get("action")
+                if action == "MOCK_SOS":
                     target_cam = str(msg.get("cam_id", "0"))
-                    sector_name = CAMERA_FEEDS.get(target_cam, {}).get("name", "Sector A (Command Post Webcam)")
+                    worker = camera_manager.get_worker(target_cam)
+                    sector_name = worker.name if worker else f"Sector {target_cam}"
                     mock_alert = {
+                        "id": f"SOS-{int(time.time() * 1000) % 100000:05d}",
                         "cam_id": target_cam,
                         "sector": sector_name,
                         "threat": "ARMED_INTRUSION_SOS",
-                        "confidence": 98.6,
+                        "object": "person",
+                        "track_id": 99,
+                        "confidence": 99.4,
                         "threat_level": "CRITICAL",
+                        "event": "ZERO_LINE_BREACH",
+                        "direction": "APPROACHING",
+                        "zone": "RESTRICTED",
                         "geofence_breach": True,
                         "optical_expansion": True,
+                        "coordinates": worker.coords if worker else "LAT 34.0836° N",
                         "timestamp": time.strftime("%H:%M:%S"),
                     }
-                    await broadcast_alert(mock_alert)
-            except Exception:
-                pass
+                    camera_manager.record_and_broadcast_alert(mock_alert)
+            except Exception as ex:
+                logger.debug(f"WebSocket client message error: {ex}")
     except WebSocketDisconnect:
-        active_connections.discard(websocket)
+        async with connections_lock:
+            active_connections.discard(websocket)
         logger.info("Tactical Command Client disconnected.")
     except Exception as e:
-        active_connections.discard(websocket)
-        logger.warning(f"WebSocket connection error: {e}")
+        async with connections_lock:
+            active_connections.discard(websocket)
+        logger.warning(f"WebSocket error: {e}")
 
 
 @app.post("/api/mock_sos")
 async def trigger_mock_sos(cam_id: str = "0"):
     """Manual trigger endpoint for mock emergency SOS dispatch demonstration."""
-    sector_name = CAMERA_FEEDS.get(str(cam_id), {}).get("name", "Sector A (Command Post Webcam)")
+    worker = camera_manager.get_worker(str(cam_id))
+    sector_name = worker.name if worker else f"Sector {cam_id}"
     mock_alert = {
+        "id": f"SOS-{int(time.time() * 1000) % 100000:05d}",
         "cam_id": str(cam_id),
         "sector": sector_name,
         "threat": "CRITICAL_INTRUDER_SOS",
-        "confidence": 99.4,
+        "object": "person",
+        "track_id": 99,
+        "confidence": 99.8,
         "threat_level": "CRITICAL",
+        "event": "ZERO_LINE_BREACH",
+        "direction": "APPROACHING",
+        "zone": "RESTRICTED",
         "geofence_breach": True,
         "optical_expansion": True,
+        "coordinates": worker.coords if worker else "LAT 34.0836° N",
         "timestamp": time.strftime("%H:%M:%S"),
     }
-    await broadcast_alert(mock_alert)
+    camera_manager.record_and_broadcast_alert(mock_alert)
     return {"status": "SOS_DISPATCHED", "alert": mock_alert}
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("backend.app.main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=True)
+
