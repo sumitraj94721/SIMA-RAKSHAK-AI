@@ -1,0 +1,2 @@
+﻿# Global storage
+users = {}
